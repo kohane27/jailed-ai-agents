@@ -1,11 +1,11 @@
 {
-  description = "Secure AI Agent Playground";
+  description = "Secure AI Agent Environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     jail-nix.url = "sourcehut:~alexdavid/jail.nix";
-    llm-agents.url = "github:numtide/llm-agents.nix";
     flake-utils.url = "github:numtide/flake-utils";
+    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
   nixConfig = {
@@ -26,19 +26,33 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          config.allowUnfree = true;
         };
         jail = jail-nix.lib.init pkgs;
 
-        # Define Security Policies
+        # Define the Security Policy
         commonJailOptions = with jail.combinators; [
-          network
-          time-zone
-          no-new-session
-          notifications
-          wayland
+          network # access to the internet for API calls
+          time-zone # Neutralize the time to UTC for privacy
+          no-new-session # Prevents the agent from detaching background processes
+
+          (readwrite (noescape "~/.cache/uv"))
+          (readwrite (noescape "~/.agents"))
+          (readwrite (noescape "~/.cargo"))
+          (readwrite (noescape "~/.npm"))
+
+          (set-env "EDITOR" "vim")
+          # (readwrite (noescape "~/.config/vim"))
 
           (set-env "COLORTERM" "truecolor")
+
+          (add-runtime ''
+            RUNTIME_ARGS+=(
+              --dir /usr
+              --dir /usr/bin
+              --ro-bind "${pkgs.coreutils}/bin/env" /usr/bin/env
+              --ro-bind "${pkgs.bash}/bin/bash" /bin/bash
+            )
+          '')
 
           (add-runtime ''
             if [ -z "$PROJECT_DIR" ]; then
@@ -52,26 +66,44 @@
               exit 1
             fi
           '')
+          (try-fwd-env "PROJECT_DIR")
+
+          # (set-env "HTTP_PROXY" "http://127.0.0.1:8888")
+          # (set-env "HTTPS_PROXY" "http://127.0.0.1:8888")
         ];
 
         commonPkgs =
           with pkgs;
           [
-            bashInteractive
+            bash
             curl
             wget
             git
+            vim-full
             jq
             which
-            ripgrep
+            fd
+            gnused
             gnugrep
+            ripgrep
             gawkInteractive
             findutils
             diffutils
             ps
-            libnotify
-            wl-clipboard
-            nodePackages_latest.prettier
+            direnv
+            file
+
+            nodejs
+
+            # Claude Code and Gemini Hooks
+            uv
+            ty
+            ruff
+            python313
+            just
+
+            # formatter
+            prettier
             nixfmt
             shfmt
           ]
@@ -79,23 +111,34 @@
             llm-agents.packages.${system}.openspec
           ];
 
-        claude-code-pkg =
-          let
-            raw = llm-agents.packages.${system}.claude-code;
-          in
-          pkgs.writeShellScriptBin "claude" ''
-            exec ${raw}/bin/claude --dangerously-skip-permissions "$@"
-          '';
+        claude-code-pkg = pkgs.writeShellScriptBin "claude" ''
+          exec ${llm-agents.packages.${system}.claude-code}/bin/claude --dangerously-skip-permissions "$@"
+        '';
 
-        gemini-cli-pkg =
-          let
-            raw = llm-agents.packages.${system}.gemini-cli;
-          in
-          pkgs.writeShellScriptBin "gemini" ''
-            exec ${raw}/bin/gemini --yolo "$@"
-          '';
+        gemini-cli-pkg = pkgs.writeShellScriptBin "gemini" ''
+          exec ${llm-agents.packages.${system}.gemini-cli}/bin/gemini --approval-mode=yolo "$@"
+        '';
 
-        opencode-pkg = llm-agents.packages.${system}.opencode;
+        opencode-pkg = pkgs.writeShellScriptBin "opencode" ''
+          exec ${llm-agents.packages.${system}.opencode}/bin/opencode --auto "$@"
+        '';
+
+        codex-pkg = pkgs.writeShellScriptBin "codex" ''
+          codex_args=()
+          project_dir="''${PROJECT_DIR:-$PWD}"
+          if [ -n "$project_dir" ]; then
+            project_dir_escaped="''${project_dir//\\/\\\\}"
+            project_dir_escaped="''${project_dir_escaped//\"/\\\"}"
+            codex_args+=(
+              --cd "$project_dir"
+              --config "projects={\"$project_dir_escaped\"={trust_level=\"trusted\"}}"
+            )
+          fi
+
+          exec ${
+            llm-agents.packages.${system}.codex
+          }/bin/codex --dangerously-bypass-approvals-and-sandbox "''${codex_args[@]}" "$@"
+        '';
 
         # --- The Sandboxes ---
         makeJailedClaude =
@@ -107,6 +150,7 @@
             (
               commonJailOptions
               ++ [
+                (set-env "ANTHROPIC_MODEL" "claude-opus-5")
                 (readwrite (noescape "~/.claude"))
                 (readwrite (noescape "~/.claude.json"))
 
@@ -126,7 +170,23 @@
               commonJailOptions
               ++ [
                 (readwrite (noescape "~/.gemini"))
-                (try-fwd-env "GEMINI_API_KEY")
+
+                (add-pkg-deps commonPkgs)
+                (add-pkg-deps extraPkgs)
+              ]
+            )
+          );
+
+        makeJailedCodex =
+          {
+            extraPkgs ? [ ],
+          }:
+          jail "jailed-codex" codex-pkg (
+            with jail.combinators;
+            (
+              commonJailOptions
+              ++ [
+                (readwrite (noescape "~/.codex"))
 
                 (add-pkg-deps commonPkgs)
                 (add-pkg-deps extraPkgs)
@@ -147,9 +207,8 @@
                 (readwrite (noescape "~/.local/share/opencode"))
                 (readwrite (noescape "~/.local/state/opencode"))
 
-                # prevent re-downloading models and packages
+                # Persist caches to prevent re-downloading models and packages
                 (readwrite (noescape "~/.cache/opencode"))
-                (readwrite (noescape "~/.npm"))
 
                 (add-pkg-deps commonPkgs)
                 (add-pkg-deps extraPkgs)
@@ -163,6 +222,7 @@
             commonJailOptions
             ++ [
               (add-pkg-deps commonPkgs)
+              (add-pkg-deps [ codex-pkg ])
             ]
           )
         );
@@ -171,14 +231,15 @@
         lib = {
           inherit makeJailedClaude;
           inherit makeJailedGemini;
+          inherit makeJailedCodex;
           inherit makeJailedOpenCode;
         };
 
         devShells.default = pkgs.mkShell {
           packages = [
-            pkgs.nixd
             (makeJailedClaude { })
             (makeJailedGemini { })
+            (makeJailedCodex { })
             (makeJailedOpenCode { })
             debug
           ];
